@@ -2,6 +2,7 @@ from groq import Groq
 from dotenv import load_dotenv
 import os
 import json
+import base64
 
 # Load environment variables
 load_dotenv()
@@ -82,4 +83,82 @@ def analyze_failure(error_log: str) -> dict:
             'fix': 'Check manually',
             'confidence': 'low'
         }
+
+
+def analyze_failure_with_image(error_log: str, image_bytes: bytes, image_type: str) -> dict:
+    """
+    Analyzes Playwright failure using BOTH error log + screenshot.
+    Uses vision-capable model on Groq.
+    """
+    # Convert image bytes to base64 string
+    # This is how we send images through text-based APIs
+    image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+
+    system_prompt = """
+    You are FailWhisperer, an expert Playwright test failure analyst.
+    You will be given BOTH a Playwright error log AND a screenshot of 
+    the browser at the moment of failure.
     
+    Analyze both together for the most accurate diagnosis.
+    Look at the screenshot for:
+    - What element was visible/missing
+    - Page loading state
+    - Any visible error messages
+    - UI state that caused the failure
+    
+    Respond ONLY in this exact JSON format, no markdown:
+    {
+        "error_type": "timeout|locator|assertion|network|unknown",
+        "root_cause": "detailed explanation using both log and screenshot",
+        "is_flaky": true or false,
+        "fix": "specific fix based on what you see in the screenshot",
+        "confidence": "high|medium|low",
+        "screenshot_insight": "what you observed in the screenshot"
+    }
+    """
+
+    # Vision model API call — sends both text and image
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Analyze this Playwright failure:\n\nERROR LOG:\n{error_log}"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{image_type};base64,{image_base64}"
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0.1
+    )
+
+    raw = response.choices[0].message.content
+
+    # Strip markdown if needed
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {
+            'error_type': 'unknown',
+            'root_cause': raw,
+            'is_flaky': False,
+            'fix': 'Check manually',
+            'confidence': 'low',
+            'screenshot_insight': 'Could not parse response'
+        }

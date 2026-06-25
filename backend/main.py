@@ -1,73 +1,87 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from analyzer import analyze_failure
+from analyzer import analyze_failure, analyze_failure_with_image
+from database import save_analysis, get_history
 
-# Create FastAPI app
-# Think of this like initializing your Playwright browser instance
 app = FastAPI(
     title="FailWhisperer API",
     description="AI-powered Playwright test failure analyst",
     version="1.0.0"
 )
 
-# CORS — allows React frontend to talk to this backend
-# Without this, browser will block the connection
-# Analogy: Like allowing cross-origin requests in your API tests
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # React dev server
+    allow_origins=["http://localhost:5173"],
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
-# ── Data Models ──
-# Pydantic models = what data we expect to receive
-# Like defining your request body schema in Postman
-
 class AnalyzeRequest(BaseModel):
-    """What the frontend sends us"""
-    error_log: str          # The Playwright error log text
-    test_name: str = ""     # Optional test name
-
-class AnalyzeResponse(BaseModel):
-    """What we send back"""
-    error_type: str
-    root_cause: str
-    is_flaky: bool
-    fix: str
-    confidence: str
-    test_name: str
-
-# ── Routes / Endpoints ──
+    error_log: str
+    test_name: str = ""
 
 @app.get("/")
 def home():
-    """Health check — is server running?"""
     return {"status": "FailWhisperer is running! 🎭"}
 
-@app.post("/analyze", response_model=AnalyzeResponse)
+@app.post("/analyze")
 async def analyze(request: AnalyzeRequest):
-    """
-    Main endpoint — receives Playwright error log,
-    returns AI diagnosis.
-    
-    This is what you'll call from:
-    - Postman (today for testing)
-    - React frontend (Day 3+)
-    """
-    
-    # Validate input
     if not request.error_log.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Error log cannot be empty!"
-        )
-    
-    # Call AI analyzer
+        raise HTTPException(status_code=400, detail="Error log cannot be empty!")
+
     result = analyze_failure(request.error_log)
-    
-    # Add test name to result
     result["test_name"] = request.test_name
-    
+
+    # Save to database
+    record_id = save_analysis({
+        **result,
+        "error_log": request.error_log,
+        "has_screenshot": False
+    })
+    result["id"] = record_id
     return result
+
+@app.post("/analyze-with-image")
+async def analyze_with_image(
+    error_log: str = Form(...),
+    test_name: str = Form(""),
+    screenshot: UploadFile = File(...)
+):
+    if not error_log.strip():
+        raise HTTPException(status_code=400, detail="Error log cannot be empty!")
+
+    image_bytes = await screenshot.read()
+    image_type = screenshot.content_type or "image/png"
+
+    result = analyze_failure_with_image(error_log, image_bytes, image_type)
+    result["test_name"] = test_name
+
+    # Save to database
+    record_id = save_analysis({
+        **result,
+        "error_log": error_log,
+        "has_screenshot": True
+    })
+    result["id"] = record_id
+    return result
+
+@app.get("/history")
+def history():
+    return get_history(20)
+
+@app.post("/upload-log")
+async def upload_log(
+    log_file: UploadFile = File(...),
+    test_name: str = Form("")
+):
+    content = await log_file.read()
+    error_log = content.decode("utf-8")
+
+    if not error_log.strip():
+        raise HTTPException(status_code=400, detail="Log file is empty!")
+
+    return {
+        "error_log": error_log,
+        "filename": log_file.filename
+    }
